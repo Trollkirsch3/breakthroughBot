@@ -24,6 +24,7 @@ class Player {
         Node root = null;
         while (true) {
             String opponentMove = in.nextLine(); // last move played or "None"
+            long turnStart = System.nanoTime();
             if (opponentMove.equals("None")) {
                 white = true;
             }
@@ -39,7 +40,22 @@ class Player {
                 String moveString = in.next(); // a legal move
             }
             in.nextLine();
+            long durationLimit = firstMove
+                    ? 600_000_000L
+                    : 50_000_000L;
 
+            MiniMax miniMax = new MiniMax(turnStart + durationLimit);
+            long[] action = miniMax.search(white, field);
+            if (firstMove){
+                firstMove = false;
+            }
+            field.move(action [0], action [1], white);
+            int pawnIndex = Game.getIndexes(action [0]).get(0);
+            int moveIndex = Game.getIndexes(action [1]).get(0);
+            Position moveFromPos = new Position(pawnIndex);
+            Position moveToPos = new Position(moveIndex);
+            System.out.println(moveFromPos.getChessPos() + moveToPos.getChessPos());
+            /*
             // Write an action using System.out.println()
             // To debug: System.err.println("Debug messages...");
             Node reusedRoot = null;
@@ -63,42 +79,382 @@ class Player {
             else {
                 root = new Node(null, white, field.copy(), null);
             }
-
-            long [] action = root.chooseMove(firstMove);
-            if (firstMove){
-                firstMove = false;
-            }
-            field.move(action [0], action [1], white);
-            int pawnIndex = Game.getIndexes(action [0]).get(0);
-            int moveIndex = Game.getIndexes(action [1]).get(0);
-            Position moveFromPos = new Position(pawnIndex);
-            Position moveToPos = new Position(moveIndex);
-            System.out.println(moveFromPos.getChessPos() + moveToPos.getChessPos());
-            /*
-            long possibleMoves = Game.getPossibleMoves(field.getPawns(white), field.getPawns(!white), white);
-
-            Field.printMask(possibleMoves);
-
-            List<Integer> moveIndexes = Game.getIndexes(possibleMoves);
-            int r = random.nextInt(moveIndexes.size());
-            int moveIndex = moveIndexes.get(r);
-
-            System.err.println("move: " + moveIndex);
-            Field.printMask(1L << moveIndex);
-
-            List<Long> possiblePawns = Game.getPossiblePawns(field.getPawns(white), field.getPawns(!white), moveIndex, white);
-            r = random.nextInt(possiblePawns.size());
-            long pawn = possiblePawns.get(r);
-            int pawnIndex = Game.getIndexes(pawn).get(0);
-            Position moveFromPos = new Position(pawnIndex);
-            Position moveToPos = new Position(moveIndex);
-            field.move(moveFromPos, moveToPos, white);
-            System.err.println("Field: ");
-            field.printField();
-            System.out.println(moveFromPos.getChessPos() + moveToPos.getChessPos());
             */
         }
     }
+    static class MiniMax{
+        public MiniMax (long deadline){
+            this.deadline = deadline;
+        }
+        public static final int MAX_DEPTH = 5;
+        long bestPawn;
+        long bestTarget;
+
+        long deadline;
+        long nodes;
+
+        private static final SearchTimeout TIMEOUT = new SearchTimeout();
+
+        private static final class SearchTimeout extends RuntimeException {
+            SearchTimeout() {
+                super(null, null, false, false);
+            }
+        }
+
+        private void checkTime() {
+            if (System.nanoTime() - deadline >= 0) {
+                throw TIMEOUT;
+            }
+        }
+        public long[] search(boolean white, Field field) {
+            if (field.isOver()) {
+                throw new IllegalStateException("Spiel bereits beendet");
+            }
+
+            nodes = 0;
+
+            long own = field.getPawns(white);
+            long enemy = field.getPawns(!white);
+
+            // Legal vorhandenen Zug als Rückfalloption bestimmen.
+            long targets = getPossibleMoves(own, enemy, white);
+
+            if (targets == 0) {
+                throw new IllegalStateException("Keine legalen Züge");
+            }
+
+            long completedTarget = Long.lowestOneBit(targets);
+            long sources = getPossiblePawns(
+                    own, enemy, completedTarget, white
+            );
+
+            if (sources == 0) {
+                throw new IllegalStateException("Zielfeld ohne Startbauern");
+            }
+
+            long completedPawn = Long.lowestOneBit(sources);
+            int completedDepth = 0;
+
+            bestPawn = completedPawn;
+            bestTarget = completedTarget;
+
+            for (int depth = 1; depth <= 210; depth++) {
+                try {
+                    checkTime();
+
+                    double score = miniMax(
+                            white, depth, field, depth,
+                            Double.NEGATIVE_INFINITY,
+                            Double.POSITIVE_INFINITY
+                    );
+
+                    completedPawn = bestPawn;
+                    completedTarget = bestTarget;
+                    completedDepth = depth;
+
+                    // Passend zu deinen aktuellen Endstellungswerten.
+                    if (Math.abs(score) >= 1_000_000.0) {
+                        break;
+                    }
+                } catch (SearchTimeout timeout) {
+                    break;
+                }
+            }
+
+            bestPawn = completedPawn;
+            bestTarget = completedTarget;
+
+            System.err.println(
+                    "depth=" + completedDepth + " nodes=" + nodes
+            );
+
+            return new long[]{completedPawn, completedTarget};
+        }
+        public double miniMax(boolean white, int depth, Field field, int maxDepth, double alpha, double beta){
+            // Am Wurzelknoten und danach alle 256 Knoten prüfen.
+            if ((nodes++ & 255L) == 0 || depth == maxDepth) {
+                checkTime();
+            }
+            if (depth == 0 || field.isOver()){
+                return EVAL(field, white);
+            }
+            double bestValue = Double.NEGATIVE_INFINITY;
+            long ownPawns = field.getPawns(white);
+            long enemyPawns = field.getPawns(!white);
+            long allMoves = getPossibleMoves(ownPawns, enemyPawns, white);
+
+            long winningMoves = allMoves & (white ? Field.MASKE_OBERE_REIHE : Field.MASKE_UNTERE_REIHE);
+            if (Long.bitCount(enemyPawns) == 1) {
+                winningMoves |= allMoves & enemyPawns;
+            }
+
+            long remaining = allMoves & ~winningMoves;
+
+            long captureMoves = remaining & enemyPawns;
+            long quietMoves = remaining & ~enemyPawns;
+            long behindFrontMask;
+
+            if (white) {
+                int frontRank =
+                        Long.numberOfTrailingZeros(enemyPawns) >>> 3;
+
+                behindFrontMask = frontRank == 7
+                        ? 0L
+                        : (-1L << ((frontRank + 1) * 8));
+            } else {
+                int frontRank =
+                        (63 - Long.numberOfLeadingZeros(enemyPawns)) >>> 3;
+
+                behindFrontMask = (1L << (frontRank * 8)) - 1;
+            }
+
+            long advancedMoves = quietMoves & behindFrontMask;
+            quietMoves &= ~advancedMoves;
+
+
+            long oldWhite = field.whitePawnMask;
+            long oldBlack = field.blackPawnMask;
+
+            for (int phase = 0; phase < 4; phase++) {
+                long targets = 0L;
+                if (phase == 0){
+                    targets = winningMoves;
+                }
+                if (phase == 1){
+                    targets = captureMoves;
+                }
+                else if (phase ==2){
+                    targets = advancedMoves;
+                }
+                else if (phase == 3){
+                    targets = quietMoves;
+                }
+
+                while (targets != 0) {
+                    long move = Long.lowestOneBit(targets);
+                    targets &= targets - 1;
+
+                    long possiblePawns =
+                            getPossiblePawns(ownPawns, enemyPawns, move, white);
+
+                    while (possiblePawns != 0) {
+                        long pawn = Long.lowestOneBit(possiblePawns);
+                        possiblePawns &= possiblePawns - 1;
+
+                        double result;
+
+                        try {
+                            field.move(pawn, move, white);
+
+                            result = -miniMax(
+                                    !white, depth - 1, field,
+                                    maxDepth, -beta, -alpha
+                            );
+                        } finally {
+                            field.whitePawnMask = oldWhite;
+                            field.blackPawnMask = oldBlack;
+                        }
+
+                        if (result > bestValue) {
+                            bestValue = result;
+
+                            if (depth == maxDepth) {
+                                bestPawn = pawn;
+                                bestTarget = move;
+                            }
+                        }
+
+                        alpha = Math.max(alpha, result);
+
+                        if (alpha >= beta) {
+                            return bestValue;
+                        }
+                    }
+                }
+            }
+
+            return bestValue;
+        }
+        public static long getPossibleMoves(
+                long pawns, long otherPawns, boolean white) {
+
+            long diagonal;
+            long forward;
+
+            if (white) {
+                diagonal = ((pawns << 7) & Field.NOT_H_FILE)
+                        | ((pawns << 9) & Field.NOT_A_FILE);
+                forward = pawns << 8;
+            } else {
+                diagonal = ((pawns >>> 7) & Field.NOT_A_FILE)
+                        | ((pawns >>> 9) & Field.NOT_H_FILE);
+                forward = pawns >>> 8;
+            }
+
+            diagonal &= ~pawns;
+            forward &= ~(pawns | otherPawns);
+
+            return diagonal | forward;
+        }
+        public static long getPossiblePawns(long pawns, long field, long move, boolean white){
+            if (white){
+                return getPossibleWhitePawns(pawns, field, move);
+            }
+            else{
+                return getPossibleBlackPawns(pawns, field, move);
+            }
+        }
+        public static long getPossibleWhitePawns(long pawns, long field, long move){
+            long possiblePawnMask = move >>> (7) & Field.NOT_A_FILE | move >>> (9) & Field.NOT_H_FILE;
+            if ((move & field) == 0) {
+                possiblePawnMask |= move >>> 8;
+            }
+            possiblePawnMask &=pawns;
+            return possiblePawnMask;
+        }
+        public static long getPossibleBlackPawns(long pawns, long field, long move){
+            long possiblePawnMask = move << (7) & Field.NOT_H_FILE | move << (9) & Field.NOT_A_FILE;
+            if ((move & field) == 0) {
+                possiblePawnMask |= move << 8;
+            }
+            possiblePawnMask &=pawns;
+            return possiblePawnMask;
+        }
+    public static double EVAL(Field field, boolean white) {
+        long wp = field.whitePawnMask;
+        long bp = field.blackPawnMask;
+
+        // Endstellungen haben Vorrang vor Positionsmerkmalen.
+        if (field.isOver()) {
+            return field.getWinnner() == white
+                    ? 1_000_000.0
+                    : -1_000_000.0;
+        }
+
+        long controlledWhite = ((wp << 7) & Game.NOT_H_FILE) | ((wp << 9) & Game.NOT_A_FILE);
+
+        long controlledBlack = ((bp >>> 7) & Game.NOT_A_FILE) | ((bp >>> 9) & Game.NOT_H_FILE);
+
+        long guardedWhite = controlledWhite & wp;
+        long guardedBlack = controlledBlack & bp;
+
+        long guardedChainWhite =  ((guardedWhite << 7) & Game.NOT_H_FILE) | ((guardedWhite << 9) & Game.NOT_A_FILE);
+        long guardedChainBlack =  ((guardedBlack >>> 7) & Game.NOT_A_FILE) | ((guardedBlack >>> 9) & Game.NOT_H_FILE);
+
+        guardedChainWhite &= wp;
+        guardedChainBlack &= bp;
+
+        long controlledWhiteSquaresWhite = Field.MASKE_WHITE_SQUARES & controlledWhite;
+        long controlledWhiteSquaresBlack = Field.MASKE_WHITE_SQUARES & controlledBlack;
+
+        long controlledBlackSquaresWhite = Field.MASKE_BLACK_SQUARES & controlledWhite;
+        long controlledBlackSquaresBlack = Field.MASKE_BLACK_SQUARES & controlledBlack;
+
+
+
+
+        //long saveWhite = guardedWhite | (wp & ~controlledBlack);
+        //long saveBlack = guardedBlack | (bp & ~controlledWhite);
+
+        //long guardedFinalWhite =
+        //   guardedWhite & Field.MASKE_DEFAULT_BLACK_PAWNS;
+
+        //long guardedFinalBlack =
+        //    guardedBlack & Field.MASKE_DEFAULT_WHITE_PAWNS;
+
+        long attackedUnguardedBlack = bp & ~guardedBlack & controlledWhite;
+
+        long attackedUnguardedWhite = wp & ~guardedWhite & controlledBlack;
+
+        //long advancedPawnsWhite = Field.MASKE_OBERE_HÄLFTE & wp;
+        //long advancedPawnsBlack = Field.MASKE_UNTERE_HÄLFTE & bp;
+
+        //long doublePawnsWhite = wp & (wp << 8);
+        //long doublePawnsBlack = bp & (bp >>> 8);
+
+        long centerPawnsWhite = wp & Field.MASKE_MITTE_WHITE;
+        long centerPawnsBlack = bp & Field.MASKE_MITTE_BLACK;
+
+        //long backrowWhite = wp & Field.MASKE_UNTERE_REIHE;
+        //long backrowBlack = bp & Field.MASKE_OBERE_REIHE;
+        // Zunächst alles aus weißer Perspektive bewerten.
+        double score =
+                10* (Long.bitCount(wp) - Long.bitCount(bp))
+                        //+ 0*(Long.bitCount(backrowWhite) - Long.bitCount(backrowBlack))
+
+                        //+ 0.5 * Math.abs(Long.bitCount(controlledWhiteSquaresWhite) - Long.bitCount(controlledBlackSquaresWhite))
+                        //- 0.5 * Math.abs(Long.bitCount(controlledWhiteSquaresBlack) - Long.bitCount(controlledBlackSquaresBlack))
+
+                        + 1 * (Long.bitCount(guardedChainWhite) -Long.bitCount(guardedChainBlack))
+
+                        + 2* (
+                        Long.bitCount(attackedUnguardedBlack)
+                                - Long.bitCount(attackedUnguardedWhite)
+                )
+
+                        + 1 * (
+                        Long.bitCount(guardedWhite)
+                                - Long.bitCount(guardedBlack))
+
+                        // Mitte nur leicht belohnen, hier nur bei gedeckten Figuren.
+                        + 0.5 * (
+                        Long.bitCount(centerPawnsWhite & guardedWhite)
+                                - Long.bitCount(centerPawnsBlack & guardedBlack));
+
+
+
+        return white ? score : -score;
+    }
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     public static double getHistoryScore(long move, boolean white) {
         if (white) {
             return whiteHistory.getOrDefault(move, 0.0);
@@ -121,14 +477,17 @@ class Player {
 }
 
 class Field{
+    public static final long NOT_A_FILE = 0xFEFEFEFEFEFEFEFEL;
+    public static final long NOT_H_FILE = 0x7F7F7F7F7F7F7F7FL;
+
     public static final long MASKE_MITTE_WHITE = 0x18181818L;
     public static final long MASKE_MITTE_BLACK = 0x1818181800000000L;
 
     public static final long MASKE_WHITE_SQUARES = 0x55aa55aa55aa55aaL;
     public static final long MASKE_BLACK_SQUARES = ~MASKE_WHITE_SQUARES;
 
-    public static final long MASKE_OBERE_HÄLFTE = 0xffffffffL;
-    public static final long MASKE_UNTERE_HÄLFTE = 0xffffffff00000000L;
+    public static final long MASKE_UNTERE_HÄLFTE = 0xffffffffL;
+    public static final long MASKE_OBERE_HÄLFTE = 0xffffffff00000000L;
     public static final long MASKE_OBERE_REIHE = 0xFF00000000000000L;
     public static final long MASKE_UNTERE_REIHE = 0xFFL;
     public static final long MASKE_DEFAULT_WHITE_PAWNS = 0xffffL;
@@ -252,38 +611,7 @@ class Game {
         mask &= ~pawns;
         return mask;
     }
-    public static List<Long> getPossibleMoveList(
-            long pawns, long otherPawns, boolean white) {
 
-        long diagonal;
-        long forward;
-
-        if (white) {
-            diagonal = ((pawns << 7) & NOT_H_FILE) | ((pawns << 9) & NOT_A_FILE);
-            forward = pawns << 8;
-        }
-        else {
-            diagonal = ((pawns >>> 7) & NOT_A_FILE) | ((pawns >>> 9) & NOT_H_FILE);
-            forward = pawns >>> 8;
-        }
-
-        // Diagonal: keine eigenen Figuren auf dem Zielfeld.
-        diagonal &= ~pawns;
-
-        // Geradeaus: Zielfeld muss vollständig leer sein.
-        forward &= ~(pawns | otherPawns);
-
-        long targets = diagonal | forward;
-
-        List<Long> possibleMoves = new ArrayList<>();
-
-        while (targets != 0) {
-            long singleTarget = Long.lowestOneBit(targets);
-            possibleMoves.add(singleTarget);
-            targets &= targets - 1;
-        }
-        return possibleMoves;
-    }
     public static List<Integer> getIndexes(long maske){
         List<Integer> positions = new ArrayList<>();
 
@@ -384,6 +712,38 @@ class Game {
         }
 
         return score;
+    }
+    public static List<Long> getPossibleMoveList(
+            long pawns, long otherPawns, boolean white) {
+
+        long diagonal;
+        long forward;
+
+        if (white) {
+            diagonal = ((pawns << 7) & NOT_H_FILE) | ((pawns << 9) & NOT_A_FILE);
+            forward = pawns << 8;
+        }
+        else {
+            diagonal = ((pawns >>> 7) & NOT_A_FILE) | ((pawns >>> 9) & NOT_H_FILE);
+            forward = pawns >>> 8;
+        }
+
+        // Diagonal: keine eigenen Figuren auf dem Zielfeld.
+        diagonal &= ~pawns;
+
+        // Geradeaus: Zielfeld muss vollständig leer sein.
+        forward &= ~(pawns | otherPawns);
+
+        long targets = diagonal | forward;
+
+        List<Long> possibleMoves = new ArrayList<>();
+
+        while (targets != 0) {
+            long singleTarget = Long.lowestOneBit(targets);
+            possibleMoves.add(singleTarget);
+            targets &= targets - 1;
+        }
+        return possibleMoves;
     }
     public static double EVAL(Field field, boolean white) {
         long wp = field.whitePawnMask;
