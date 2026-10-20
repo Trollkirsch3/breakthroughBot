@@ -536,9 +536,12 @@ class Node{
         Field simField = field.copy();
         boolean simWhite = white;
 
-        int depth = 20;
+        int depth = 25;
 
         for (int i = 0; i < depth && !simField.isOver(); i++) {
+            if (hasImmediateWin(simField, simWhite)) {
+                return simWhite ? 1.0 : -1.0;
+            }
             long[] action = getRandomMove(simWhite, simField);
 
             if (action == null) {
@@ -554,6 +557,9 @@ class Node{
         // Immer aus weißer Sicht!
         if (simField.isOver()) {
             return simField.getWinnner() ? 1.0 : -1.0;
+        }
+        if (hasImmediateWin(simField, simWhite)) {
+            return simWhite ? 1.0 : -1.0;
         }
 
         // 10.0 ist ein abstimmbarer Skalierungswert.
@@ -587,7 +593,7 @@ class Node{
             return Double.POSITIVE_INFINITY;
         }
 
-        return (double) eval / visits + Math.sqrt(2 * Math.log(parent.visits) / visits) + historyBonus;
+        return (double) eval / visits + 0.5 * Math.sqrt(2 * Math.log(parent.visits) / visits) + historyBonus;
     }
     public long[] getRandomMove(boolean white, Field simField) {
         long own = simField.getPawns(white);
@@ -676,28 +682,20 @@ class Node{
 
         return new long[]{pawn, target};
     }
-    public boolean hasImmediateWin(Field position, boolean side) {
-        List<Long> targets = Game.getPossibleMoveList(position.getPawns(side), position.getPawns(!side), side);
-
-        for (long target : targets) {
-            List<Long> pawns = Game.getPossiblePawns(
-                    position.getPawns(side),
-                    position.getPawns(!side),
-                    target,
-                    side
-            );
-
-            for (long pawn : pawns) {
-                Field next = position.copy();
-                next.move(pawn, target, side);
-
-                if (next.isOver() && next.getWinnner() == side) {
-                    return true;
-                }
-            }
+    public boolean hasImmediateWin(Field position, boolean white) {
+        if (position.isOver()) {
+            return position.getWinnner() == white;
         }
 
-        return false;
+        long goalSide = white ? Field.MASKE_OBERE_REIHE : Field.MASKE_UNTERE_REIHE;
+
+        long pawns = position.getPawns(white);
+        long enemy = position.getPawns(!white);
+
+        long controlled = white ? ((pawns << 7) & Game.NOT_H_FILE) | ((pawns << 9) & Game.NOT_A_FILE)
+                : ((pawns >>> 7) & Game.NOT_A_FILE) | ((pawns >>> 9) & Game.NOT_H_FILE);
+
+        return (controlled & goalSide) != 0 || (Long.bitCount(enemy) == 1 && (controlled & enemy) != 0);
     }
     public long [] chooseMove(boolean firstMove){
         // 1. Startzeit in Nanosekunden erfassen
