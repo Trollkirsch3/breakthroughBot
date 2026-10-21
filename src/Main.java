@@ -41,8 +41,8 @@ class Player {
             }
             in.nextLine();
             long durationLimit = firstMove
-                    ? 600_000_000L
-                    : 50_000_000L;
+                    ? 850_000_000L
+                    : 85_000_000L;
 
             MiniMax miniMax = new MiniMax(turnStart + durationLimit);
             long[] action = miniMax.search(white, field);
@@ -82,6 +82,86 @@ class Player {
             */
         }
     }
+    static class TransitionTable{
+        static final int TT_SIZE = 1 << 18; // 262.144 Einträge
+        static final int TT_MASK = TT_SIZE - 1;
+
+        static final byte EXACT = 1;
+        static final byte LOWER_BOUND = 2;
+        static final byte UPPER_BOUND = 3;
+
+        // bleiben trotz new MiniMax() pro Spielzug erhalten.
+        static final long[] ttWhite = new long[TT_SIZE];
+        static final long[] ttBlack = new long[TT_SIZE];
+        static final boolean[] ttWhiteToMove = new boolean[TT_SIZE];
+
+        static final int[] ttDepth = new int[TT_SIZE];
+        static final double[] ttScore = new double[TT_SIZE];
+        static final byte[] ttType = new byte[TT_SIZE]; // 0 = leer, byte wegen weniger speicher
+        static final int[] ttMove = new int[TT_SIZE];
+
+
+        static final long[][] ZOBRIST = new long[2][64];
+        static final long BLACK_TO_MOVE;
+
+        static {
+            Random random = new Random(123456789L);//123456789L ist der Seed --> reproduzierbar
+
+            for (int color = 0; color < 2; color++) {
+                for (int square = 0; square < 64; square++) {
+                    ZOBRIST[color][square] = random.nextLong();
+                }
+            }
+
+            BLACK_TO_MOVE = random.nextLong();
+        }
+        static long computeHash(long wp, long bp, boolean whiteToMove) {
+            long hash = whiteToMove ? 0L : BLACK_TO_MOVE;
+
+            while (wp != 0) {
+                int square = Long.numberOfTrailingZeros(wp);
+                hash ^= ZOBRIST[0][square];
+                wp &= wp - 1;
+            }
+
+            while (bp != 0) {
+                int square = Long.numberOfTrailingZeros(bp);
+                hash ^= ZOBRIST[1][square];
+                bp &= bp - 1;
+            }
+            return hash;
+        }
+        private static void storeTT(
+                int index, Field field, boolean white,
+                int depth, double score, byte type, int move) {
+            //Positionen mit mehr tiefe bevorzugen
+            boolean samePosition = ttType[index] != 0
+                    && ttWhite[index] == field.whitePawnMask
+                    && ttBlack[index] == field.blackPawnMask
+                    && ttWhiteToMove[index] == white;
+
+            if (samePosition) {
+                if (ttDepth[index] > depth) {
+                    return;
+                }
+
+                if (ttDepth[index] == depth
+                        && ttType[index] == EXACT
+                        && type != EXACT) {
+                    return;
+                }
+            }
+
+            ttWhite[index] = field.whitePawnMask;
+            ttBlack[index] = field.blackPawnMask;
+            ttWhiteToMove[index] = white;
+
+            ttDepth[index] = depth;
+            ttScore[index] = score;
+            ttMove[index] = move;
+            ttType[index] = type;
+        }
+    }
     static class MiniMax{
         public MiniMax (long deadline){
             this.deadline = deadline;
@@ -92,6 +172,8 @@ class Player {
 
         long deadline;
         long nodes;
+
+
 
         private static final SearchTimeout TIMEOUT = new SearchTimeout();
 
@@ -137,7 +219,11 @@ class Player {
 
             bestPawn = completedPawn;
             bestTarget = completedTarget;
-
+            long hash = TransitionTable.computeHash(
+                    field.whitePawnMask,
+                    field.blackPawnMask,
+                    white
+            );
             for (int depth = 1; depth <= 210; depth++) {
                 try {
                     checkTime();
@@ -145,7 +231,8 @@ class Player {
                     double score = miniMax(
                             white, depth, field, depth,
                             Double.NEGATIVE_INFINITY,
-                            Double.POSITIVE_INFINITY
+                            Double.POSITIVE_INFINITY,
+                            hash
                     );
 
                     completedPawn = bestPawn;
@@ -170,7 +257,7 @@ class Player {
 
             return new long[]{completedPawn, completedTarget};
         }
-        public double miniMax(boolean white, int depth, Field field, int maxDepth, double alpha, double beta){
+        public double miniMax(boolean white, int depth, Field field, int maxDepth, double alpha, double beta, long hash){
             // Am Wurzelknoten und danach alle 256 Knoten prüfen.
             if ((nodes++ & 255L) == 0 || depth == maxDepth) {
                 checkTime();
@@ -178,10 +265,55 @@ class Player {
             if (depth == 0 || field.isOver()){
                 return EVAL(field, white);
             }
+            int index = (int) hash & TransitionTable.TT_MASK;
+
+            boolean hit = TransitionTable.ttType[index] != 0
+                    && TransitionTable.ttWhite[index] == field.whitePawnMask
+                    && TransitionTable.ttBlack[index] == field.blackPawnMask
+                    && TransitionTable.ttWhiteToMove[index] == white;
+
+            int hashMove = hit ? TransitionTable.ttMove[index] : -1;
+
+            // Am Wurzelknoten zunächst keinen Tabellen-Cutoff verwenden.
+            // So werden bestPawn und bestTarget weiterhin regulär gesetzt.
+            if (hit && depth != maxDepth && TransitionTable.ttDepth[index] >= depth) {
+                double cached = TransitionTable.ttScore[index];
+                byte type = TransitionTable.ttType[index];
+
+                if (type == TransitionTable.EXACT
+                        || (type == TransitionTable.LOWER_BOUND && cached >= beta)
+                        || (type == TransitionTable.UPPER_BOUND && cached <= alpha)) {
+                    return cached;
+                }
+            }
+            double originalAlpha = alpha;
+            int localBestMove = -1;
+
             double bestValue = Double.NEGATIVE_INFINITY;
             long ownPawns = field.getPawns(white);
             long enemyPawns = field.getPawns(!white);
             long allMoves = getPossibleMoves(ownPawns, enemyPawns, white);
+
+            long hashPawn = 0L;
+            long hashTarget = 0L;
+
+            if (hashMove >= 0 && hashMove < 4096) {
+                int from = hashMove >>> 6;
+                int to = hashMove & 63;
+
+                long pawn = 1L << from;
+                long target = 1L << to;
+
+                // Prüfen, ob genau dieser Zug legal ist.
+                if ((allMoves & target) != 0
+                        && (getPossiblePawns(
+                        ownPawns, enemyPawns, target, white
+                ) & pawn) != 0) {
+
+                    hashPawn = pawn;
+                    hashTarget = target;
+                }
+            }
 
             long winningMoves = allMoves & (white ? Field.MASKE_OBERE_REIHE : Field.MASKE_UNTERE_REIHE);
             if (Long.bitCount(enemyPawns) == 1) {
@@ -195,15 +327,11 @@ class Player {
             long behindFrontMask;
 
             if (white) {
-                int frontRank =
-                        Long.numberOfTrailingZeros(enemyPawns) >>> 3;
+                int frontRank = Long.numberOfTrailingZeros(enemyPawns) >>> 3;
 
-                behindFrontMask = frontRank == 7
-                        ? 0L
-                        : (-1L << ((frontRank + 1) * 8));
+                behindFrontMask = frontRank == 7 ? 0L : (-1L << ((frontRank + 1) * 8));
             } else {
-                int frontRank =
-                        (63 - Long.numberOfLeadingZeros(enemyPawns)) >>> 3;
+                int frontRank = (63 - Long.numberOfLeadingZeros(enemyPawns)) >>> 3;
 
                 behindFrontMask = (1L << (frontRank * 8)) - 1;
             }
@@ -214,49 +342,95 @@ class Player {
 
             long oldWhite = field.whitePawnMask;
             long oldBlack = field.blackPawnMask;
-
-            for (int phase = 0; phase < 4; phase++) {
+            boolean firstMove = true;
+            for (int phase = -1; phase < 4; phase++) {
                 long targets = 0L;
-                if (phase == 0){
+                if (phase == -1) {
+                    targets = hashTarget;
+                }
+                else if (phase == 0){
                     targets = winningMoves;
                 }
-                if (phase == 1){
+                else if (phase == 1){
                     targets = captureMoves;
                 }
                 else if (phase ==2){
                     targets = advancedMoves;
                 }
-                else if (phase == 3){
+                else if (phase == 3) {
                     targets = quietMoves;
                 }
-
                 while (targets != 0) {
                     long move = Long.lowestOneBit(targets);
                     targets &= targets - 1;
 
-                    long possiblePawns =
-                            getPossiblePawns(ownPawns, enemyPawns, move, white);
+                    long possiblePawns;
+
+                    if (phase == -1) {
+                        possiblePawns = hashPawn;
+                    } else {
+                        possiblePawns =
+                                getPossiblePawns(ownPawns, enemyPawns, move, white);
+
+                        if (move == hashTarget) {
+                            possiblePawns &= ~hashPawn;
+                        }
+                    }
 
                     while (possiblePawns != 0) {
                         long pawn = Long.lowestOneBit(possiblePawns);
                         possiblePawns &= possiblePawns - 1;
 
                         double result;
+                        int color = white ? 0 : 1;
+                        int from = Long.numberOfTrailingZeros(pawn);
+                        int to = Long.numberOfTrailingZeros(move);
+
+                        long nextHash = hash
+                                ^ TransitionTable.ZOBRIST[color][from]
+                                ^ TransitionTable.ZOBRIST[color][to]
+                                ^ TransitionTable.BLACK_TO_MOVE;
+
+                        if ((enemyPawns & move) != 0) {
+                            nextHash ^= TransitionTable.ZOBRIST[color ^ 1][to];
+                        }
 
                         try {
                             field.move(pawn, move, white);
 
-                            result = -miniMax(
-                                    !white, depth - 1, field,
-                                    maxDepth, -beta, -alpha
-                            );
+                            if (firstMove) {
+                                // Erster tatsächlich untersuchter Zug: volles Fenster.
+                                result = -miniMax(
+                                        !white, depth - 1, field, maxDepth,
+                                        -beta, -alpha, nextHash
+                                );
+                            } else {
+                                // Weitere Züge: zunächst enges Testfenster.
+                                result = -miniMax(
+                                        !white, depth - 1, field, maxDepth,
+                                        -alpha - 1, -alpha, nextHash
+                                );
+
+                                if (result > alpha && result < beta) {
+                                    // Könnte der neue beste Zug sein:
+                                    // erneut mit vollem Fenster untersuchen.
+                                    result = -miniMax(
+                                            !white, depth - 1, field, maxDepth,
+                                            -beta, -alpha, nextHash
+                                    );
+                                }
+                            }
                         } finally {
                             field.whitePawnMask = oldWhite;
                             field.blackPawnMask = oldBlack;
                         }
 
+                        firstMove = false;
+
                         if (result > bestValue) {
                             bestValue = result;
+
+                            localBestMove = (from << 6) | to;
 
                             if (depth == maxDepth) {
                                 bestPawn = pawn;
@@ -267,11 +441,30 @@ class Player {
                         alpha = Math.max(alpha, result);
 
                         if (alpha >= beta) {
+                            TransitionTable.storeTT(
+                                    index, field, white, depth,
+                                    bestValue, TransitionTable.LOWER_BOUND, localBestMove
+                            );
                             return bestValue;
                         }
                     }
                 }
             }
+
+            if (localBestMove == -1) {
+                throw new IllegalStateException(
+                        "Keine Züge in einer nicht beendeten Stellung"
+                );
+            }
+
+            byte type = bestValue <= originalAlpha
+                    ? TransitionTable.UPPER_BOUND
+                    : TransitionTable.EXACT;
+
+            TransitionTable.storeTT(
+                    index, field, white, depth,
+                    bestValue, type, localBestMove
+            );
 
             return bestValue;
         }
@@ -344,12 +537,13 @@ class Player {
         guardedChainWhite &= wp;
         guardedChainBlack &= bp;
 
-        long controlledWhiteSquaresWhite = Field.MASKE_WHITE_SQUARES & controlledWhite;
-        long controlledWhiteSquaresBlack = Field.MASKE_WHITE_SQUARES & controlledBlack;
+        long pawnsOnWhiteSquaresWhite = Field.MASKE_WHITE_SQUARES & wp;
+        long pawnsOnBlackSquaresWhite = Field.MASKE_BLACK_SQUARES & wp;
+        int pawnSquareRatioWhite = Long.bitCount(pawnsOnWhiteSquaresWhite) - Long.bitCount(pawnsOnBlackSquaresWhite);
 
-        long controlledBlackSquaresWhite = Field.MASKE_BLACK_SQUARES & controlledWhite;
-        long controlledBlackSquaresBlack = Field.MASKE_BLACK_SQUARES & controlledBlack;
-
+        long pawnsOnWhiteSquaresBlack = Field.MASKE_WHITE_SQUARES & bp;
+        long pawnsOnBlackSquaresBlack = Field.MASKE_BLACK_SQUARES & bp;
+        int pawnSquareRatioBlack = Long.bitCount(pawnsOnWhiteSquaresBlack) - Long.bitCount(pawnsOnBlackSquaresBlack);
 
 
 
@@ -368,6 +562,22 @@ class Player {
 
         //long advancedPawnsWhite = Field.MASKE_OBERE_HÄLFTE & wp;
         //long advancedPawnsBlack = Field.MASKE_UNTERE_HÄLFTE & bp;
+        long dangerousPawnsWhite = 0L;
+        if (pawnSquareRatioBlack > 0) {
+            dangerousPawnsWhite = pawnsOnBlackSquaresWhite;
+        } else if (pawnSquareRatioBlack < 0) {
+            dangerousPawnsWhite = pawnsOnWhiteSquaresWhite;
+        }
+
+        long dangerousPawnsBlack = 0L;
+        if (pawnSquareRatioWhite > 0) {
+            dangerousPawnsBlack = pawnsOnBlackSquaresBlack;
+        } else if (pawnSquareRatioWhite < 0) {
+            dangerousPawnsBlack = pawnsOnWhiteSquaresBlack;
+        }
+
+        dangerousPawnsWhite &= Field.MASKE_OBERE_HÄLFTE;
+        dangerousPawnsBlack &= Field.MASKE_UNTERE_HÄLFTE;
 
         //long doublePawnsWhite = wp & (wp << 8);
         //long doublePawnsBlack = bp & (bp >>> 8);
@@ -379,15 +589,15 @@ class Player {
         //long backrowBlack = bp & Field.MASKE_OBERE_REIHE;
         // Zunächst alles aus weißer Perspektive bewerten.
         double score =
-                10* (Long.bitCount(wp) - Long.bitCount(bp))
+                6* (Long.bitCount(wp) - Long.bitCount(bp))
                         //+ 0*(Long.bitCount(backrowWhite) - Long.bitCount(backrowBlack))
+                        + 2.0 * (Long.bitCount(dangerousPawnsWhite)- Long.bitCount(dangerousPawnsBlack))
 
-                        //+ 0.5 * Math.abs(Long.bitCount(controlledWhiteSquaresWhite) - Long.bitCount(controlledBlackSquaresWhite))
-                        //- 0.5 * Math.abs(Long.bitCount(controlledWhiteSquaresBlack) - Long.bitCount(controlledBlackSquaresBlack))
+                        - 0.5*(Math.abs(pawnSquareRatioWhite) - Math.abs(pawnSquareRatioBlack))
 
-                        + 1 * (Long.bitCount(guardedChainWhite) -Long.bitCount(guardedChainBlack))
+                        + 0.3 * (Long.bitCount(guardedChainWhite) -Long.bitCount(guardedChainBlack))
 
-                        + 2* (
+                        + 1* (
                         Long.bitCount(attackedUnguardedBlack)
                                 - Long.bitCount(attackedUnguardedWhite)
                 )
